@@ -1,13 +1,12 @@
 apiVersion: confidentialcontainers.org/v1beta1
 kind: CcRuntime
 metadata:
-  name: ccruntime
+  name: ccruntime-sample
 spec:
-  # Add fields here
   runtimeName: kata
   ccNodeSelector:
     matchLabels:
-      node.kubernetes.io/worker: ""
+      node-role.kubernetes.io/worker: ""
   config:
     installType: bundle
     payloadImage: quay.io/kata-containers/kata-deploy:stable
@@ -16,23 +15,23 @@ spec:
     uninstallDoneLabel:
       katacontainers.io/kata-runtime: "cleanup"
     installerVolumeMounts:
-      - mountPath: /etc/crio/
-        name: crio-conf
-      - mountPath: /etc/containerd/
-        name: containerd-conf
+      # RKE2 uses a different containerd path
+      - mountPath: /var/lib/rancher/rke2/agent/etc/containerd/
+        name: rke2-containerd-conf
       - mountPath: /usr/local/bin/
         name: local-bin
       - mountPath: /host/
         name: host
+      # Add RKE2 specific paths
+      - mountPath: /var/lib/rancher/rke2/
+        name: rke2-root
+      - mountPath: /run/k3s/containerd/
+        name: containerd-socket
     installerVolumes:
       - hostPath:
-          path: /etc/crio/
+          path: /var/lib/rancher/rke2/agent/etc/containerd/
           type: ""
-        name: crio-conf
-      - hostPath:
-          path: /etc/containerd/
-          type: ""
-        name: containerd-conf
+        name: rke2-containerd-conf
       - hostPath:
           path: /usr/local/bin/
           type: ""
@@ -41,81 +40,56 @@ spec:
           path: /
           type: ""
         name: host
+      # Add RKE2 specific volumes
+      - hostPath:
+          path: /var/lib/rancher/rke2/
+          type: ""
+        name: rke2-root
+      - hostPath:
+          path: /run/k3s/containerd/
+          type: ""
+        name: containerd-socket
     installCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "install"]
     uninstallCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "cleanup"]
     cleanupCmd: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "reset"]
-    # Uncomment and add the required RuntimeClasses to be created
-    # If this is commented, then the operator creates 3 default runtimeclasses "kata", "kata-clh", "kata-qemu"
     runtimeClasses: 
       []
-    postUninstall:
-      image: quay.io/confidential-containers/reqs-payload
-      volumeMounts:
-        - mountPath: /opt/confidential-containers/
-          name: confidential-containers-artifacts
-        - mountPath: /etc/systemd/system/
-          name: etc-systemd-system
-        - mountPath: /etc/containerd/
-          name: containerd-conf
-        - mountPath: /usr/local/bin/
-          name: local-bin
-        - mountPath: /var/lib/containerd-nydus/
-          name: containerd-nydus
-      volumes:
-        - hostPath:
-            path: /opt/confidential-containers/
-            type: DirectoryOrCreate
-          name: confidential-containers-artifacts
-        - hostPath:
-            path: /etc/systemd/system/
-            type: ""
-          name: etc-systemd-system
-        - hostPath:
-            path: /etc/containerd/
-            type: ""
-          name: containerd-conf
-        - hostPath:
-            path: /usr/local/bin/
-            type: ""
-          name: local-bin
-        - hostPath:
-            path: /var/lib/containerd-nydus/
-            type: ""
-          name: containerd-nydus
     preInstall:
       image: quay.io/confidential-containers/reqs-payload
       volumeMounts:
         - mountPath: /opt/confidential-containers/
           name: confidential-containers-artifacts
-        - mountPath: /etc/systemd/system/
-          name: etc-systemd-system
-        - mountPath: /etc/containerd/
-          name: containerd-conf
+        - mountPath: /var/lib/rancher/rke2/agent/etc/containerd/
+          name: rke2-containerd-conf
         - mountPath: /usr/local/bin/
           name: local-bin
-        - mountPath: /var/lib/containerd-nydus/
-          name: containerd-nydus
+        # Add RKE2 specific mounts
+        - mountPath: /var/lib/rancher/rke2/
+          name: rke2-root
+        - mountPath: /run/k3s/containerd/
+          name: containerd-socket
       volumes:
         - hostPath:
             path: /opt/confidential-containers/
             type: DirectoryOrCreate
           name: confidential-containers-artifacts
         - hostPath:
-            path: /etc/systemd/system/
+            path: /var/lib/rancher/rke2/agent/etc/containerd/
             type: ""
-          name: etc-systemd-system
-        - hostPath:
-            path: /etc/containerd/
-            type: ""
-          name: containerd-conf
+          name: rke2-containerd-conf
         - hostPath:
             path: /usr/local/bin/
             type: ""
           name: local-bin
+        # Add RKE2 specific volumes
         - hostPath:
-            path: /var/lib/containerd-nydus/
+            path: /var/lib/rancher/rke2/
             type: ""
-          name: containerd-nydus
+          name: rke2-root
+        - hostPath:
+            path: /run/k3s/containerd/
+            type: ""
+          name: containerd-socket
     environmentVariables:
       - name: NODE_NAME
         valueFrom:
@@ -125,24 +99,22 @@ spec:
       - name: "CONFIGURE_CC"
         value: "yes"
       - name: "DEBUG"
-        value: "false"
-      # If set to true, this will install the CoCo fork of the containerd,
-      # the one allowing images to be pulled inside the guest and has patches
-      # for handling GPU / VFIO, on the node
-      # default: true
+        value: "true"
+      # Disable all containerd installations since RKE2 manages its own containerd
       - name: "INSTALL_COCO_CONTAINERD"
         value: "false"
-      # If set to true, this will install the v1.7.0 release of containerd on the node.
-      # default: false
       - name: "INSTALL_OFFICIAL_CONTAINERD"
-        value: "true"
-      # If set to true, this will install the CoCo fork of the containerd,
-      # the one that has patches for handling GPU / VFIO, on the node
-      # default: false
+        value: "false"
       - name: "INSTALL_VFIO_GPU_CONTAINERD"
         value: "false"
-      # If set to true, this will install nydus-snapshotter and nydus-image
-      # on the node
-      # default: false
       - name: "INSTALL_NYDUS_SNAPSHOTTER"
+        value: "false"
+      # Add RKE2-specific variables
+      - name: "CONTAINERD_CONFIG_PATH"
+        value: "/var/lib/rancher/rke2/agent/etc/containerd/config.toml.d"
+      - name: "CONTAINERD_SOCKET_PATH"
+        value: "/run/k3s/containerd/containerd.sock"
+      - name: "SYSTEMD_SERVICE_DIR"
+        value: "/etc/systemd/system"
+      - name: "IS_RKE2_NODE"
         value: "true"
