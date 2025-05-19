@@ -1,17 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 nameSuffix: -sample
-
 resources:
 - ../base
-
 images:
 - name: quay.io/confidential-containers/reqs-payload
   newTag: b495f450fbcd5c199b8635a7dfefe1b5d763c378
 - name: quay.io/kata-containers/kata-deploy
   newTag: 3.15.0
-
 patches:
 - patch: |-
     - op: replace
@@ -23,38 +19,42 @@ patches:
       - name: "kata-qemu"
         snapshotter: ""
         pulltype: ""
-      - name: "kata-qemu-coco-dev"
-        snapshotter: "nydus"
-        pulltype: "guest-pull"
       - name: "kata-qemu-tdx"
-        snapshotter: "nydus"
-        pulltype: "guest-pull"
-      - name: "kata-qemu-snp"
-        snapshotter: "nydus"
-        pulltype: "guest-pull"
+        snapshotter: ""
+        pulltype: ""
     - op: add
       path: /spec/config/defaultRuntimeClassName
       value: "kata-qemu"
     - op: add
       path: /spec/config/debug
-      value: false
-    - op: add
+      value: true
+    - op: replace
       path: /spec/config/environmentVariables
       value:
-        # It means that we're relying on the cluster to already have
-        # containerd v1.7+ running.  If you know for sure that's not
-        # the case, please, set this variable to `true`
-        - name: "INSTALL_OFFICIAL_CONTAINERD"
-          value: "false"
-        # If set, the Kata Containers agent https_proxy will be set to the
-        # specified value allowing then the pod sandbox to correctly pull
-        # images in such environment. 
-        # - name: "AGENT_HTTPS_PROXY"
-        #   value: "https://proxy.example.com:3129"
-        # If set, the Kata Containers agent no_proxy will be set to the
-        # specified value allowing then the pod sandbox to correctly pull
-        # images in such environment.
-        # - name: "AGENT_NO_PROXY"
-        #   value: "*.test.example.com,.example.org,127.0.0.0/8"
+      # It means that we're relying on the cluster to already have
+      # containerd v1.7+ running. If you know for sure that's not
+      # the case, please, set this variable to `true`
+      - name: "INSTALL_OFFICIAL_CONTAINERD"
+        value: "false"
+      # Explicitly disable CoCo containerd
+      - name: "INSTALL_COCO_CONTAINERD"
+        value: "false"
+      # Explicitly disable VFIO GPU containerd
+      - name: "INSTALL_VFIO_GPU_CONTAINERD"
+        value: "false"
+      # Explicitly disable Nydus snapshotter
+      - name: "INSTALL_NYDUS_SNAPSHOTTER"
+        value: "false"
+      # RKE2-specific paths
+      - name: "CONTAINERD_CONFIG_PATH"
+        value: "/var/lib/rancher/rke2/agent/etc/containerd/config.toml.d"
+      - name: "CONTAINERD_SOCKET_PATH" 
+        value: "/run/k3s/containerd/containerd.sock"
+      # Extra debug info
+      - name: "DEBUG"
+        value: "true"
+      # Skip systemd operations that might fail on RKE2
+      - name: "SKIP_SYSTEMD_OPERATIONS"
+        value: "true"
   target:
     kind: CcRuntime
