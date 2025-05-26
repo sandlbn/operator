@@ -14,11 +14,34 @@ images:
   newTag: kata-containers-latest
 
 patches:
-# First patch - disable the pre-install daemon completely
+# First patch - disable the pre-install daemon by scaling to 0
 - patch: |-
-    - op: replace
-      path: /spec/replicas
-      value: 0
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: cc-operator-pre-install-daemon
+      namespace: confidential-containers-system
+    spec:
+      template:
+        spec:
+          containers:
+          - name: cc-operator-pre-install-daemon
+            env:
+            - name: "INSTALL_OFFICIAL_CONTAINERD"
+              value: "false"
+            - name: "INSTALL_COCO_CONTAINERD"
+              value: "false"
+            - name: "INSTALL_VFIO_GPU_CONTAINERD"
+              value: "false"
+            - name: "INSTALL_NYDUS_SNAPSHOTTER"
+              value: "false"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Pre-install daemon disabled for RKE2/K3s compatibility"
+              echo "Skipping containerd installation/restart"
+              sleep infinity
   target:
     kind: DaemonSet
     name: cc-operator-pre-install-daemon
@@ -26,14 +49,6 @@ patches:
 
 # Second patch - configure the CcRuntime
 - patch: |-
-    - op: replace
-      path: /spec/config/preInstall
-      value:
-        enabled: false
-    - op: replace
-      path: /spec/config/postUninstall
-      value:
-        enabled: false
     - op: replace
       path: /spec/config/runtimeClasses
       value:
@@ -60,8 +75,6 @@ patches:
         - name: "CONFIGURE_CC"
           value: "yes"
         - name: "DEBUG"
-          value: "true"
-        - name: "SKIP_CONTAINERD_RESTART"
           value: "true"
     - op: replace
       path: /spec/config/installCmd
@@ -258,7 +271,6 @@ patches:
             path: /opt/kata-artifacts/
             type: DirectoryOrCreate
           name: kata-artifacts
-          readOnly: true
         - hostPath:
             path: /var/lib/rancher/rke2/agent/etc/containerd/
             type: DirectoryOrCreate
@@ -288,7 +300,6 @@ patches:
       value:
         - mountPath: /opt/kata-artifacts/
           name: kata-artifacts
-          readOnly: true
         - mountPath: /var/lib/rancher/rke2/agent/etc/containerd/
           name: rke2-containerd-conf
         - mountPath: /var/lib/rancher/k3s/agent/etc/containerd/
