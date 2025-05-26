@@ -1,0 +1,140 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+nameSuffix: -rancher
+
+resources:
+- ../base
+
+images:
+- name: quay.io/confidential-containers/reqs-payload
+  newTag: latest
+- name: quay.io/kata-containers/kata-deploy
+  newName: quay.io/kata-containers/kata-deploy-ci
+  newTag: kata-containers-latest
+
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/config/runtimeClasses
+      value:
+      - name: "kata-clh"
+        snapshotter: ""
+        pulltype: ""
+      - name: "kata-qemu"
+        snapshotter: ""
+        pulltype: ""
+      - name: "kata-qemu-tdx"
+        snapshotter: ""
+        pulltype: ""
+      - name: "kata-qemu-snp"
+        snapshotter: ""
+        pulltype: ""
+    - op: add
+      path: /spec/config/defaultRuntimeClassName
+      value: "kata-qemu"
+    - op: add
+      path: /spec/config/debug
+      value: false
+    - op: add
+      path: /spec/config/environmentVariables
+      value:
+        # Don't install containerd for Rancher-managed clusters
+        - name: "INSTALL_OFFICIAL_CONTAINERD"
+          value: "false"
+        - name: "INSTALL_COCO_CONTAINERD"
+          value: "false"
+        - name: "INSTALL_VFIO_GPU_CONTAINERD"
+          value: "false"
+        # Disable nydus for RKE2/K3s based Rancher
+        - name: "INSTALL_NYDUS_SNAPSHOTTER"
+          value: "false"
+        # Rancher-specific configurations
+        - name: "RANCHER_DEPLOYMENT"
+          value: "true"
+        # Auto-detect containerd socket location
+        - name: "AUTO_DETECT_CONTAINERD"
+          value: "true"
+    - op: replace
+      path: /spec/config/installerVolumes
+      value:
+        # RKE2 paths
+        - hostPath:
+            path: /var/lib/rancher/rke2/agent/etc/containerd/
+            type: DirectoryOrCreate
+          name: rke2-containerd-conf
+        # K3s paths
+        - hostPath:
+            path: /var/lib/rancher/k3s/agent/etc/containerd/
+            type: DirectoryOrCreate
+          name: k3s-containerd-conf
+        # Standard containerd paths (for RKE1)
+        - hostPath:
+            path: /etc/containerd/
+            type: DirectoryOrCreate
+          name: containerd-conf
+        - hostPath:
+            path: /usr/local/bin/
+            type: ""
+          name: local-bin
+        - hostPath:
+            path: /
+            type: ""
+          name: host
+        # Multiple possible socket locations
+        - hostPath:
+            path: /run/k3s/containerd/
+            type: DirectoryOrCreate
+          name: k3s-containerd-sock
+        - hostPath:
+            path: /run/containerd/
+            type: DirectoryOrCreate
+          name: containerd-sock
+        - hostPath:
+            path: /opt/kata/
+            type: DirectoryOrCreate
+          name: kata-artifacts
+        # Rancher state directory
+        - hostPath:
+            path: /var/lib/rancher/
+            type: DirectoryOrCreate
+          name: rancher-state
+    - op: replace
+      path: /spec/config/installerVolumeMounts
+      value:
+        - mountPath: /etc/containerd/
+          name: containerd-conf
+        - mountPath: /var/lib/rancher/rke2/agent/etc/containerd/
+          name: rke2-containerd-conf
+        - mountPath: /var/lib/rancher/k3s/agent/etc/containerd/
+          name: k3s-containerd-conf
+        - mountPath: /usr/local/bin/
+          name: local-bin
+        - mountPath: /host/
+          name: host
+        - mountPath: /run/containerd/
+          name: containerd-sock
+        - mountPath: /run/k3s/containerd/
+          name: k3s-containerd-sock
+        - mountPath: /opt/kata/
+          name: kata-artifacts
+        - mountPath: /var/lib/rancher/
+          name: rancher-state
+    - op: add
+      path: /spec/ccNodeSelector
+      value:
+        matchExpressions:
+        - key: node-role.kubernetes.io/worker
+          operator: In
+          values:
+          - "true"
+        - key: node-role.kubernetes.io/etcd
+          operator: NotIn
+          values:
+          - "true"
+        - key: node-role.kubernetes.io/controlplane
+          operator: NotIn
+          values:
+          - "true"
+  target:
+    kind: CcRuntime
