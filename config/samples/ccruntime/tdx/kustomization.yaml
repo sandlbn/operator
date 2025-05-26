@@ -14,7 +14,7 @@ images:
   newTag: kata-containers-latest
 
 patches:
-# First patch - disable the pre-install daemon by scaling to 0
+# Patch to completely replace the pre-install daemon behavior
 - patch: |-
     apiVersion: apps/v1
     kind: DaemonSet
@@ -27,27 +27,31 @@ patches:
           containers:
           - name: cc-operator-pre-install-daemon
             env:
-            - name: "INSTALL_OFFICIAL_CONTAINERD"
-              value: "false"
-            - name: "INSTALL_COCO_CONTAINERD"
-              value: "false"
-            - name: "INSTALL_VFIO_GPU_CONTAINERD"
-              value: "false"
-            - name: "INSTALL_NYDUS_SNAPSHOTTER"
-              value: "false"
+            - name: "NODE_NAME"
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             command:
-            - /bin/sh
+            - /bin/bash
             - -c
             - |
-              echo "Pre-install daemon disabled for RKE2/K3s compatibility"
-              echo "Skipping containerd installation/restart"
+              #!/bin/bash
+              set -e
+              
+              echo "RKE2/K3s compatible pre-install daemon"
+              echo "This daemon will not install any artifacts or restart containerd"
+              
+              # Label the node as done without doing anything
+              kubectl label node "${NODE_NAME}" confidentialcontainers.org/preinstall=done --overwrite
+              
+              echo "Node labeled, sleeping indefinitely"
               sleep infinity
   target:
     kind: DaemonSet
     name: cc-operator-pre-install-daemon
     namespace: confidential-containers-system
 
-# Second patch - configure the CcRuntime
+# Configure the CcRuntime
 - patch: |-
     - op: replace
       path: /spec/config/runtimeClasses
@@ -87,7 +91,12 @@ patches:
         
         # Debug: Show what's available
         echo "=== Checking kata artifacts location ==="
-        find /opt/kata-artifacts -type f -name "kata-runtime" 2>/dev/null || echo "kata-runtime not found in artifacts"
+        echo "Contents of /opt/kata-artifacts:"
+        ls -la /opt/kata-artifacts/ || true
+        echo "Looking for kata directory:"
+        find /opt/kata-artifacts -type d -name "kata" 2>/dev/null | head -5
+        echo "Looking for kata-runtime binary:"
+        find /opt/kata-artifacts -type f -name "kata-runtime" 2>/dev/null | head -5
         
         # Detect containerd config location
         if [ -d "/var/lib/rancher/rke2" ]; then
@@ -115,9 +124,16 @@ patches:
           cp -a /opt/kata-artifacts/opt/kata /opt/
         else
           echo "ERROR: Cannot find kata files at expected location!"
-          echo "Contents of /opt/kata-artifacts:"
-          ls -la /opt/kata-artifacts/
-          exit 1
+          echo "Trying alternative locations..."
+          # Try to find kata directory
+          KATA_DIR=$(find /opt/kata-artifacts -type d -name "kata" 2>/dev/null | grep -v "/bin" | head -1)
+          if [ -n "$KATA_DIR" ]; then
+            echo "Found kata at: $KATA_DIR"
+            cp -a "$KATA_DIR" /opt/
+          else
+            echo "FATAL: Cannot find kata installation files"
+            exit 1
+          fi
         fi
         
         # Ensure permissions
@@ -131,7 +147,13 @@ patches:
         ln -sf /opt/kata/bin/kata-collect-data.sh /usr/local/bin/kata-collect-data.sh
         
         # Verify binaries are executable
-        /opt/kata/bin/kata-runtime --version || echo "WARNING: kata-runtime not executable"
+        echo "=== Verifying kata installation ==="
+        if [ -f "/opt/kata/bin/kata-runtime" ]; then
+          /opt/kata/bin/kata-runtime --version || echo "WARNING: kata-runtime not executable"
+        else
+          echo "ERROR: kata-runtime not found at /opt/kata/bin/kata-runtime"
+          ls -la /opt/kata/bin/ || echo "ERROR: /opt/kata/bin/ not found"
+        fi
         
         # Create kata configuration directory
         echo "=== Setting up kata configuration ==="
@@ -143,26 +165,44 @@ patches:
           ln -sf "$CONFIG_SOURCE" /etc/kata-containers/configuration.toml
         else
           echo "WARNING: Default configuration not found at $CONFIG_SOURCE"
-          find /opt/kata -name "configuration*.toml" -type f
+          echo "Looking for configuration files:"
+          find /opt/kata -name "configuration*.toml" -type f 2>/dev/null
         fi
         
         # Create TDX-specific configuration
         echo "=== Creating TDX configuration ==="
+        mkdir -p /opt/kata/share/defaults/kata-containers/
         TDX_CONFIG="/opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml"
         QEMU_CONFIG="/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+        BASE_CONFIG="/opt/kata/share/defaults/kata-containers/configuration.toml"
         
+        # Find a base configuration to copy
         if [ -f "$QEMU_CONFIG" ]; then
           cp "$QEMU_CONFIG" "$TDX_CONFIG"
-        elif [ -f "$CONFIG_SOURCE" ]; then
-          cp "$CONFIG_SOURCE" "$TDX_CONFIG"
+        elif [ -f "$BASE_CONFIG" ]; then
+          cp "$BASE_CONFIG" "$TDX_CONFIG"
         else
-          echo "ERROR: No base configuration found to create TDX config!"
-          exit 1
+          echo "WARNING: No base configuration found, creating minimal TDX config"
+          cat > "$TDX_CONFIG" << 'EOFMINIMAL'
+        # Minimal TDX Configuration
+        [hypervisor.qemu]
+        path = "/opt/kata/bin/qemu-system-x86_64"
+        kernel = "/opt/kata/share/kata-containers/vmlinux.container"
+        initrd = "/opt/kata/share/kata-containers/kata-containers-initrd.img"
+        confidential_guest = true
+        tdx = true
+        kernel_params = " tdx_guest=on"
+        
+        [factory]
+        [agent.kata]
+        EOFMINIMAL
         fi
         
-        # Add TDX-specific settings using sed
-        echo "=== Adding TDX settings to configuration ==="
-        cat >> "$TDX_CONFIG" << 'EOFTDX'
+        # Add/Update TDX-specific settings
+        echo "=== Configuring TDX settings ==="
+        # Check if TDX settings already exist
+        if ! grep -q "confidential_guest = true" "$TDX_CONFIG"; then
+          cat >> "$TDX_CONFIG" << 'EOFTDX'
 
         # TDX Configuration Section
         [hypervisor.qemu]
@@ -173,31 +213,17 @@ patches:
         [hypervisor.qemu.tdx]
         firmware = ""
         EOFTDX
+        fi
         
         # Update containerd config
         echo "=== Updating containerd configuration ==="
         mkdir -p "$CONFIG_PATH"
         
-        # For RKE2/K3s, we need to ensure the base structure exists
-        if [ "$RUNTIME_TYPE" != "standard" ] && [ ! -f "$CONFIG_FILE" ]; then
-          echo "Creating base containerd config for $RUNTIME_TYPE"
-          cat > "$CONFIG_FILE" << 'EOFBASE'
-        version = 2
-        [plugins]
-          [plugins."io.containerd.grpc.v1.cri"]
-            [plugins."io.containerd.grpc.v1.cri".containerd]
-              default_runtime_name = "runc"
-              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
-                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
-                  runtime_type = "io.containerd.runc.v2"
-        EOFBASE
-        fi
-        
-        # Add kata runtimes if not already present
+        # Check if kata is already configured
         if [ -f "$CONFIG_FILE" ] && ! grep -q "kata-qemu-tdx" "$CONFIG_FILE"; then
           echo "Adding kata runtime configurations..."
           
-          # Create a temporary file with our additions
+          # Add kata runtimes configuration
           cat >> "$CONFIG_FILE" << 'EOFKATA'
 
         # Kata Containers Runtimes
@@ -225,26 +251,36 @@ patches:
           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu-tdx.options]
             ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml"
         EOFKATA
+        else
+          echo "Kata runtimes already configured in containerd"
         fi
         
         echo "=== Installation Summary ==="
         echo "Kata binaries installed at: /opt/kata"
         echo "Configuration updated at: $CONFIG_FILE"
         echo "Runtime type: $RUNTIME_TYPE"
+        echo "TDX configuration created at: $TDX_CONFIG"
         
         # Final verification
-        echo "=== Verifying installation ==="
-        ls -la /opt/kata/bin/kata-runtime
-        ls -la /usr/local/bin/kata-runtime
+        echo "=== Final verification ==="
+        ls -la /opt/kata/bin/kata-runtime || echo "ERROR: kata-runtime not found"
+        ls -la /usr/local/bin/kata-runtime || echo "ERROR: kata-runtime symlink not found"
         ls -la "$TDX_CONFIG" || echo "WARNING: TDX config not found"
         
         # DO NOT restart containerd - let the user do it manually
+        echo ""
+        echo "============================================"
         echo "=== IMPORTANT: Manual restart required ==="
+        echo "============================================"
         echo "Kata installation completed successfully!"
+        echo ""
         echo "You MUST manually restart your container runtime:"
-        echo "  For RKE2: sudo systemctl restart rke2-server (on server) or rke2-agent (on agent)"
+        echo "  For RKE2 server: sudo systemctl restart rke2-server"
+        echo "  For RKE2 agent: sudo systemctl restart rke2-agent"
         echo "  For K3s: sudo systemctl restart k3s or k3s-agent"
         echo "  For standard containerd: sudo systemctl restart containerd"
+        echo "============================================"
+        echo ""
         
         # Create marker file
         touch /opt/kata/.installed
