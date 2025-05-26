@@ -89,14 +89,20 @@ patches:
         set -ex
         echo "Installing Kata for RKE2/K3s with TDX support..."
         
-        # Debug: Show what's available
+        # Debug: Show what's available in kata-artifacts
         echo "=== Checking kata artifacts location ==="
         echo "Contents of /opt/kata-artifacts:"
         ls -la /opt/kata-artifacts/ || true
-        echo "Looking for kata directory:"
-        find /opt/kata-artifacts -type d -name "kata" 2>/dev/null | head -5
-        echo "Looking for kata-runtime binary:"
-        find /opt/kata-artifacts -type f -name "kata-runtime" 2>/dev/null | head -5
+        echo "Contents of /opt/kata-artifacts/opt:"
+        ls -la /opt/kata-artifacts/opt/ || true
+        echo "Contents of /opt/kata-artifacts/opt/kata:"
+        ls -la /opt/kata-artifacts/opt/kata/ || true
+        
+        # Verify kata files are where we expect them
+        if [ -d "/opt/kata-artifacts/opt/kata/bin" ]; then
+          echo "Found kata bin directory"
+          ls -la /opt/kata-artifacts/opt/kata/bin/ | head -10
+        fi
         
         # Detect containerd config location
         if [ -d "/var/lib/rancher/rke2" ]; then
@@ -116,27 +122,33 @@ patches:
           echo "Using standard containerd path"
         fi
         
-        # Install kata binaries
+        # Install kata binaries from the correct location
         echo "=== Installing kata binaries ==="
         if [ -d "/opt/kata-artifacts/opt/kata" ]; then
           echo "Found kata at /opt/kata-artifacts/opt/kata"
+          echo "Creating /opt directory if it doesn't exist"
           mkdir -p /opt
+          echo "Copying kata files to /opt/kata"
           cp -a /opt/kata-artifacts/opt/kata /opt/
+          echo "Copy completed"
         else
-          echo "ERROR: Cannot find kata files at expected location!"
-          echo "Trying alternative locations..."
-          # Try to find kata directory
-          KATA_DIR=$(find /opt/kata-artifacts -type d -name "kata" 2>/dev/null | grep -v "/bin" | head -1)
-          if [ -n "$KATA_DIR" ]; then
-            echo "Found kata at: $KATA_DIR"
-            cp -a "$KATA_DIR" /opt/
-          else
-            echo "FATAL: Cannot find kata installation files"
-            exit 1
-          fi
+          echo "ERROR: Cannot find kata files at /opt/kata-artifacts/opt/kata"
+          echo "Searching for kata files..."
+          find /opt/kata-artifacts -type d -name "kata" 2>/dev/null
+          exit 1
         fi
         
+        # Verify the copy was successful
+        if [ ! -d "/opt/kata" ]; then
+          echo "ERROR: Failed to copy kata to /opt/kata"
+          exit 1
+        fi
+        
+        echo "Kata directory contents:"
+        ls -la /opt/kata/
+        
         # Ensure permissions
+        echo "Setting executable permissions on kata binaries"
         chmod +x /opt/kata/bin/* || true
         
         # Create symlinks
@@ -144,15 +156,18 @@ patches:
         mkdir -p /usr/local/bin
         ln -sf /opt/kata/bin/kata-runtime /usr/local/bin/kata-runtime
         ln -sf /opt/kata/bin/containerd-shim-kata-v2 /usr/local/bin/containerd-shim-kata-v2
-        ln -sf /opt/kata/bin/kata-collect-data.sh /usr/local/bin/kata-collect-data.sh
+        if [ -f "/opt/kata/bin/kata-collect-data.sh" ]; then
+          ln -sf /opt/kata/bin/kata-collect-data.sh /usr/local/bin/kata-collect-data.sh
+        fi
         
         # Verify binaries are executable
         echo "=== Verifying kata installation ==="
         if [ -f "/opt/kata/bin/kata-runtime" ]; then
-          /opt/kata/bin/kata-runtime --version || echo "WARNING: kata-runtime not executable"
+          echo "Testing kata-runtime binary:"
+          /opt/kata/bin/kata-runtime --version || echo "WARNING: kata-runtime not working properly"
         else
           echo "ERROR: kata-runtime not found at /opt/kata/bin/kata-runtime"
-          ls -la /opt/kata/bin/ || echo "ERROR: /opt/kata/bin/ not found"
+          exit 1
         fi
         
         # Create kata configuration directory
@@ -160,59 +175,82 @@ patches:
         mkdir -p /etc/kata-containers/
         
         # Find and link the configuration
-        CONFIG_SOURCE="/opt/kata/share/defaults/kata-containers/configuration.toml"
-        if [ -f "$CONFIG_SOURCE" ]; then
-          ln -sf "$CONFIG_SOURCE" /etc/kata-containers/configuration.toml
+        CONFIG_DIR="/opt/kata/share/defaults/kata-containers"
+        if [ -d "$CONFIG_DIR" ]; then
+          echo "Found kata config directory at $CONFIG_DIR"
+          ls -la "$CONFIG_DIR/" || true
+          
+          # Link the main configuration
+          if [ -f "$CONFIG_DIR/configuration.toml" ]; then
+            ln -sf "$CONFIG_DIR/configuration.toml" /etc/kata-containers/configuration.toml
+            echo "Linked main configuration"
+          else
+            echo "WARNING: configuration.toml not found"
+          fi
         else
-          echo "WARNING: Default configuration not found at $CONFIG_SOURCE"
-          echo "Looking for configuration files:"
+          echo "WARNING: kata config directory not found at $CONFIG_DIR"
+          echo "Searching for configuration files:"
           find /opt/kata -name "configuration*.toml" -type f 2>/dev/null
         fi
         
         # Create TDX-specific configuration
         echo "=== Creating TDX configuration ==="
-        mkdir -p /opt/kata/share/defaults/kata-containers/
-        TDX_CONFIG="/opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml"
-        QEMU_CONFIG="/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
-        BASE_CONFIG="/opt/kata/share/defaults/kata-containers/configuration.toml"
+        TDX_CONFIG="$CONFIG_DIR/configuration-qemu-tdx.toml"
+        QEMU_CONFIG="$CONFIG_DIR/configuration-qemu.toml"
+        BASE_CONFIG="$CONFIG_DIR/configuration.toml"
         
-        # Find a base configuration to copy
+        # Ensure the config directory exists
+        mkdir -p "$CONFIG_DIR"
+        
+        # Find a base configuration to copy for TDX
         if [ -f "$QEMU_CONFIG" ]; then
+          echo "Using qemu configuration as base for TDX"
           cp "$QEMU_CONFIG" "$TDX_CONFIG"
         elif [ -f "$BASE_CONFIG" ]; then
+          echo "Using base configuration for TDX"
           cp "$BASE_CONFIG" "$TDX_CONFIG"
         else
           echo "WARNING: No base configuration found, creating minimal TDX config"
           cat > "$TDX_CONFIG" << 'EOFMINIMAL'
-        # Minimal TDX Configuration
+        # Kata TDX Configuration
         [hypervisor.qemu]
         path = "/opt/kata/bin/qemu-system-x86_64"
-        kernel = "/opt/kata/share/kata-containers/vmlinux.container"
-        initrd = "/opt/kata/share/kata-containers/kata-containers-initrd.img"
+        kernel = "/opt/kata/share/kata-containers/vmlinuz.container"
+        image = "/opt/kata/share/kata-containers/kata-containers.img"
+        machine_type = "q35"
         confidential_guest = true
         tdx = true
-        kernel_params = " tdx_guest=on"
+        kernel_params = "console=hvc0 console=hvc1 agent.use_vsock=true tdx_guest=on"
+        default_vcpus = 1
+        default_memory = 2048
         
-        [factory]
         [agent.kata]
+        enable_debug = true
+        
+        [runtime]
+        enable_debug = true
         EOFMINIMAL
         fi
         
         # Add/Update TDX-specific settings
         echo "=== Configuring TDX settings ==="
         # Check if TDX settings already exist
-        if ! grep -q "confidential_guest = true" "$TDX_CONFIG"; then
+        if ! grep -q "tdx = true" "$TDX_CONFIG" 2>/dev/null; then
+          echo "Adding TDX configuration sections"
           cat >> "$TDX_CONFIG" << 'EOFTDX'
 
-        # TDX Configuration Section
+        # TDX Configuration Override
         [hypervisor.qemu]
         confidential_guest = true
         tdx = true
-        kernel_params = " tdx_guest=on"
-
+        
         [hypervisor.qemu.tdx]
-        firmware = ""
         EOFTDX
+        fi
+        
+        # Also update kernel params for TDX if not already present
+        if ! grep -q "tdx_guest=on" "$TDX_CONFIG" 2>/dev/null; then
+          sed -i '/kernel_params = /s/"$/ tdx_guest=on"/' "$TDX_CONFIG" 2>/dev/null || true
         fi
         
         # Update containerd config
@@ -221,7 +259,7 @@ patches:
         
         # Check if kata is already configured
         if [ -f "$CONFIG_FILE" ] && ! grep -q "kata-qemu-tdx" "$CONFIG_FILE"; then
-          echo "Adding kata runtime configurations..."
+          echo "Adding kata runtime configurations to $CONFIG_FILE"
           
           # Add kata runtimes configuration
           cat >> "$CONFIG_FILE" << 'EOFKATA'
@@ -251,6 +289,7 @@ patches:
           [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu-tdx.options]
             ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml"
         EOFKATA
+          echo "Kata runtime configurations added"
         else
           echo "Kata runtimes already configured in containerd"
         fi
@@ -263,9 +302,14 @@ patches:
         
         # Final verification
         echo "=== Final verification ==="
-        ls -la /opt/kata/bin/kata-runtime || echo "ERROR: kata-runtime not found"
-        ls -la /usr/local/bin/kata-runtime || echo "ERROR: kata-runtime symlink not found"
+        echo "Checking kata-runtime:"
+        ls -la /opt/kata/bin/kata-runtime && /opt/kata/bin/kata-runtime --version
+        echo "Checking symlink:"
+        ls -la /usr/local/bin/kata-runtime
+        echo "Checking TDX config:"
         ls -la "$TDX_CONFIG" || echo "WARNING: TDX config not found"
+        echo "Checking main config:"
+        ls -la /etc/kata-containers/configuration.toml || echo "WARNING: Main config link not found"
         
         # DO NOT restart containerd - let the user do it manually
         echo ""
@@ -285,6 +329,7 @@ patches:
         # Create marker file
         touch /opt/kata/.installed
         echo "Installation completed at $(date)" > /opt/kata/.installed
+        echo "Kata version: $(/opt/kata/bin/kata-runtime --version)" >> /opt/kata/.installed
     - op: replace
       path: /spec/config/uninstallCmd
       value:
