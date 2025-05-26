@@ -51,6 +51,14 @@ patches:
         set -e
         echo "Installing Kata for RKE2/K3s with TDX support..."
         
+        # Debug: Show what's available
+        echo "Contents of /opt/kata-artifacts:"
+        ls -la /opt/kata-artifacts/ || true
+        echo "Contents of /opt/kata-artifacts/opt:"
+        ls -la /opt/kata-artifacts/opt/ || true
+        echo "Contents of /opt/kata-artifacts/opt/kata:"
+        ls -la /opt/kata-artifacts/opt/kata/ || true
+        
         # Detect containerd config location
         if [ -d "/var/lib/rancher/rke2" ]; then
           CONFIG_PATH="/var/lib/rancher/rke2/agent/etc/containerd"
@@ -66,10 +74,21 @@ patches:
           echo "Using standard containerd path"
         fi
         
-        # Install kata binaries
+        # Install kata binaries - FIX: correct source path
         echo "Installing kata binaries..."
-        cp -a /opt/kata-artifacts/opt/kata /opt/
-        chmod +x /opt/kata/bin/*
+        if [ -d "/opt/kata-artifacts/opt/kata" ]; then
+          echo "Found kata at /opt/kata-artifacts/opt/kata"
+          cp -a /opt/kata-artifacts/opt/kata /opt/
+        elif [ -d "/opt/kata" ]; then
+          echo "Kata already installed at /opt/kata"
+        else
+          echo "ERROR: Cannot find kata files!"
+          find /opt/kata-artifacts -type d -name kata 2>/dev/null || true
+          exit 1
+        fi
+        
+        # Ensure permissions
+        chmod +x /opt/kata/bin/* || true
         
         # Create symlinks
         mkdir -p /usr/local/bin
@@ -85,7 +104,14 @@ patches:
         echo "Creating TDX configuration..."
         TDX_CONFIG="/opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml"
         if [ ! -f "$TDX_CONFIG" ]; then
-          cp /opt/kata/share/defaults/kata-containers/configuration-qemu.toml "$TDX_CONFIG"
+          # First check if base configuration exists
+          if [ -f "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml" ]; then
+            cp /opt/kata/share/defaults/kata-containers/configuration-qemu.toml "$TDX_CONFIG"
+          elif [ -f "/opt/kata/share/defaults/kata-containers/configuration.toml" ]; then
+            cp /opt/kata/share/defaults/kata-containers/configuration.toml "$TDX_CONFIG"
+          else
+            echo "WARNING: No base configuration found"
+          fi
           
           # Add TDX-specific settings
           cat >> "$TDX_CONFIG" << 'EOFTDX'
@@ -106,8 +132,20 @@ patches:
         echo "Updating containerd configuration..."
         mkdir -p "$CONFIG_PATH"
         
+        # Check if config file exists
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "Creating new containerd config at $CONFIG_FILE"
+          cat > "$CONFIG_FILE" << 'EOFBASE'
+        version = 2
+        [plugins]
+          [plugins."io.containerd.grpc.v1.cri"]
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        EOFBASE
+        fi
+        
         # Check if kata is already configured
-        if [ -f "$CONFIG_FILE" ] && ! grep -q "io.containerd.kata.v2" "$CONFIG_FILE"; then
+        if ! grep -q "io.containerd.kata.v2" "$CONFIG_FILE"; then
           echo "Adding kata runtime configuration to containerd..."
           cat >> "$CONFIG_FILE" << 'EOFCONFIG'
 
@@ -142,6 +180,13 @@ patches:
         fi
         
         echo "Kata installation completed!"
+        echo "Configuration file updated at: $CONFIG_FILE"
+        
+        # Verify installation
+        echo "Verifying installation..."
+        ls -la /opt/kata/bin/kata-runtime || echo "WARNING: kata-runtime not found"
+        ls -la /usr/local/bin/kata-runtime || echo "WARNING: kata-runtime symlink not created"
+        
         echo "Please restart your RKE2/K3s service:"
         echo "  For RKE2: sudo systemctl restart rke2-agent"
         echo "  For K3s: sudo systemctl restart k3s-agent"
@@ -160,6 +205,16 @@ patches:
         rm -f /usr/local/bin/containerd-shim-kata-v2
         rm -f /usr/local/bin/kata-collect-data.sh
         rm -rf /etc/kata-containers
+        
+        # Remove kata configurations from containerd
+        for config in /var/lib/rancher/rke2/agent/etc/containerd/config.toml.tmpl /var/lib/rancher/k3s/agent/etc/containerd/config.toml.tmpl /etc/containerd/config.toml; do
+          if [ -f "$config" ]; then
+            echo "Removing kata configuration from $config"
+            sed -i '/# Kata Containers Runtime/,/\[plugins\."io.containerd.grpc.v1.cri".containerd.runtimes.kata-qemu-tdx.options\]/d' "$config"
+            sed -i '/ConfigPath.*kata-containers/d' "$config"
+          fi
+        done
+        
         echo "Kata uninstalled"
     - op: replace
       path: /spec/config/installerVolumes
@@ -188,6 +243,10 @@ patches:
             path: /opt/kata/
             type: DirectoryOrCreate
           name: kata-install
+        - hostPath:
+            path: /etc/kata-containers/
+            type: DirectoryOrCreate
+          name: kata-config
     - op: replace
       path: /spec/config/installerVolumeMounts
       value:
@@ -204,6 +263,8 @@ patches:
           name: local-bin
         - mountPath: /opt/kata/
           name: kata-install
+        - mountPath: /etc/kata-containers/
+          name: kata-config
     - op: add
       path: /spec/ccNodeSelector
       value:
