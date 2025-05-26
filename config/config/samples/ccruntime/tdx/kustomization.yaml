@@ -1,0 +1,191 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+nameSuffix: -tdx
+
+resources:
+- ../base
+
+images:
+- name: quay.io/confidential-containers/reqs-payload
+  newTag: latest
+- name: quay.io/kata-containers/kata-deploy
+  newName: quay.io/kata-containers/kata-deploy-ci
+  newTag: kata-containers-latest
+
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/config/runtimeClasses
+      value:
+      # TDX-enabled runtime as primary
+      - name: "kata-qemu-tdx"
+        snapshotter: ""
+        pulltype: ""
+      # Regular kata as fallback for non-confidential workloads
+      - name: "kata-qemu"
+        snapshotter: ""
+        pulltype: ""
+    - op: add
+      path: /spec/config/defaultRuntimeClassName
+      value: "kata-qemu"
+    - op: add
+      path: /spec/config/debug
+      value: true  # Enable debug for TDX troubleshooting
+    - op: add
+      path: /spec/config/environmentVariables
+      value:
+        # Don't install containerd for RKE2/K3s
+        - name: "INSTALL_OFFICIAL_CONTAINERD"
+          value: "false"
+        - name: "INSTALL_COCO_CONTAINERD"
+          value: "false"
+        - name: "INSTALL_VFIO_GPU_CONTAINERD"
+          value: "false"
+        # Disable nydus for RKE2/K3s
+        - name: "INSTALL_NYDUS_SNAPSHOTTER"
+          value: "false"
+        # Enable TDX configuration
+        - name: "ENABLE_TDX"
+          value: "true"
+        # Configure for confidential containers
+        - name: "CONFIGURE_CC"
+          value: "yes"
+        # Auto-detect containerd paths
+        - name: "AUTO_DETECT_CONTAINERD"
+          value: "true"
+        # TDX-specific environment variables
+        - name: "TDX_ENABLED"
+          value: "true"
+        - name: "KERNEL_MODULES_DIR"
+          value: "/lib/modules"
+        - name: "HOST_KERNEL"
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+    - op: replace
+      path: /spec/config/preInstall/cmd
+      value:
+      - /bin/bash
+      - -c
+      - |
+        echo "Checking TDX support on the host..."
+        # Check if TDX is available
+        if [ -e /sys/firmware/tdx ]; then
+          echo "TDX firmware interface detected"
+        else
+          echo "WARNING: TDX firmware interface not found"
+        fi
+        
+        # Check CPU flags
+        if grep -q tdx /proc/cpuinfo; then
+          echo "TDX CPU flag detected"
+        else
+          echo "WARNING: TDX CPU flag not found in /proc/cpuinfo"
+        fi
+        
+        # Check if TDX module is loaded
+        if lsmod | grep -q tdx; then
+          echo "TDX kernel module is loaded"
+        else
+          echo "WARNING: TDX kernel module not loaded"
+        fi
+        
+        # Continue with normal pre-install
+        /opt/confidential-containers/reqs.sh
+    - op: add
+      path: /spec/config/postInstall
+      value:
+        image: quay.io/confidential-containers/reqs-payload
+        cmd:
+        - /bin/bash
+        - -c
+        - |
+          echo "Configuring TDX-specific settings..."
+          
+          # Create TDX configuration directory
+          mkdir -p /opt/confidential-containers/tdx
+          
+          # Create TDX-specific kata configuration
+          cat > /opt/kata/share/defaults/kata-containers/configuration-qemu-tdx.toml << 'EOF'
+          [hypervisor.qemu]
+          path = "/opt/kata/bin/qemu-system-x86_64"
+          kernel = "/opt/kata/share/kata-containers/vmlinuz-tdx.container"
+          image = "/opt/kata/share/kata-containers/kata-containers-tdx.img"
+          machine_type = "q35"
+          confidential_guest = true
+          tdx = true
+          kernel_params = "console=hvc0 console=hvc1 agent.use_vsock=true tdx_guest=on"
+          firmware = ""
+          firmware_volume = ""
+          default_vcpus = 1
+          default_maxvcpus = 2
+          default_memory = 2048
+          disable_block_device_use = false
+          shared_fs = "none"
+          enable_annotations = ["enable_iommu"]
+          valid_hypervisor_paths = ["/opt/kata/bin/qemu-system-x86_64"]
+          
+          [hypervisor.qemu.tdx]
+          # TDX specific configuration
+          
+          [agent.kata]
+          enable_tracing = true
+          trace_mode = "dynamic"
+          
+          [runtime]
+          enable_annotations = ["enable_iommu", "tdx_guest"]
+          internetworking_model="tcfilter"
+          disable_guest_seccomp=true
+          sandbox_cgroup_only=false
+          static_sandbox_resource_mgmt=true
+          experimental=["tdx"]
+          EOF
+          
+          echo "TDX configuration completed"
+    - op: add
+      path: /spec/ccNodeSelector
+      value:
+        matchLabels:
+          # Only deploy on TDX-capable nodes
+          feature.node.kubernetes.io/cpu-security.tdx: "true"
+    - op: replace
+      path: /spec/config/installerVolumes
+      value:
+        # RKE2 paths
+        - hostPath:
+            path: /var/lib/rancher/rke2/agent/etc/containerd/
+            type: DirectoryOrCreate
+          name: rke2-containerd-conf
+        # K3s paths
+        - hostPath:
+            path: /var/lib/rancher/k3s/agent/etc/containerd/
+            type: DirectoryOrCreate
+          name: k3s-containerd-conf
+        - hostPath:
+            path: /usr/local/bin/
+            type: ""
+          name: local-bin
+        - hostPath:
+            path: /
+            type: ""
+          name: host
+        - hostPath:
+            path: /run/k3s/containerd/
+            type: DirectoryOrCreate
+          name: k3s-containerd-sock
+        - hostPath:
+            path: /opt/kata/
+            type: DirectoryOrCreate
+          name: kata-artifacts
+        # TDX specific paths
+        - hostPath:
+            path: /sys/firmware/
+            type: Directory
+          name: firmware
+        - hostPath:
+            path: /dev/tdx
+            type: CharDevice
+          name: tdx-device
+  target:
+    kind: CcRuntime
